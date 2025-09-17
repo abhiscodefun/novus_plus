@@ -7,13 +7,29 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:network_info_plus/network_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_compass/flutter_compass.dart';
-import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:google_fonts/google_fonts.dart';
 
-void main() => runApp(const MyApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  try {
+    await FirebaseAuth.instance.signInAnonymously();
+  } catch (e) {
+    // Firebase Auth not enabled, app will not work properly
+    debugPrint('Firebase Auth failed: $e');
+  }
+  runApp(const MyApp());
+}
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
@@ -37,10 +53,7 @@ class MapScreen extends StatefulWidget {
 class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   final MapController _mapController = MapController();
   LatLng? myLocation;
-  String? myIp, wifiName;
-  List<String> peerIps = [];
   Map<String, LatLng> peerLocations = {};
-  Map<String, double> peerProximityRadius = {}; // Store proximity radius for each peer
   double headingDegrees = 0.0;
   double compassOffset = 0.0;
   double magneticDeclination = 0.0;
@@ -48,13 +61,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   double? headingAccuracy;
   List<double> headingBuffer = [];
   double lastStableHeading = 0.0;
-  double proximityRadius = 50;
+  final double proximityRadius = 10000; // Temporarily increased for testing
   bool blinking = false;
   bool firstCentered = false;
   bool compassMode = true;
   late final AudioPlayer beepPlayer;
-  late RawDatagramSocket udpSocket;
-  Timer? proximityBroadcastTimer;
+  late String deviceId;
+  late DatabaseReference databaseRef;
+  Timer? locationUpdateTimer;
   
   // Animation controllers for smooth rotation
   late AnimationController _carRotationController;
@@ -86,12 +100,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     ));
     
     _loadPrefs();
-    _fetchNetworkInfo();
     _startCompass();
     _startLocation();
-    _startServer();
-    _startUDPServer();
-    _startProximityBroadcast();
+    _getDeviceId();
+    _startLocationUpdateTimer();
     beepPlayer = AudioPlayer();
   }
 
@@ -99,46 +111,83 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   void dispose() {
     _carRotationController.dispose();
     _blinkController.dispose();
-    proximityBroadcastTimer?.cancel();
-    udpSocket.close();
+    locationUpdateTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      peerIps = prefs.getStringList('peers') ?? [];
-      proximityRadius = prefs.getDouble('proximity') ?? 50;
       compassOffset = prefs.getDouble('compassOffset') ?? 0.0;
       magneticDeclination = prefs.getDouble('magneticDeclination') ?? 0.0;
       compassMode = prefs.getBool('compassMode') ?? true;
-      
-      // Load peer proximity radii
-      for (String ip in peerIps) {
-        peerProximityRadius[ip] = prefs.getDouble('proximity_$ip') ?? 50;
-      }
     });
   }
 
   Future<void> _savePrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList('peers', peerIps);
-    await prefs.setDouble('proximity', proximityRadius);
     await prefs.setDouble('compassOffset', compassOffset);
     await prefs.setDouble('magneticDeclination', magneticDeclination);
     await prefs.setBool('compassMode', compassMode);
-    
-    // Save peer proximity radii
-    for (String ip in peerProximityRadius.keys) {
-      await prefs.setDouble('proximity_$ip', peerProximityRadius[ip] ?? 50);
-    }
   }
 
-  Future<void> _fetchNetworkInfo() async {
-    final info = NetworkInfo();
-    myIp = await info.getWifiIP();
-    wifiName = await info.getWifiName();
-    setState(() {});
+  void _getDeviceId() {
+    if (FirebaseAuth.instance.currentUser != null) {
+      deviceId = FirebaseAuth.instance.currentUser!.uid;
+    } else {
+      // Fallback if auth failed
+      deviceId = 'fallback-device-${DateTime.now().millisecondsSinceEpoch}';
+    }
+    databaseRef = FirebaseDatabase.instance.ref('devices/$deviceId');
+    _startFirebaseListener();
+  }
+
+  void _startLocationUpdateTimer() {
+    locationUpdateTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (myLocation != null) {
+        debugPrint('Publishing location: ${myLocation!.latitude}, ${myLocation!.longitude}');
+        databaseRef.set({
+          'lat': myLocation!.latitude,
+          'lng': myLocation!.longitude,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        });
+      }
+    });
+  }
+
+  void _startFirebaseListener() {
+    debugPrint('Starting Firebase listener for device: $deviceId');
+    FirebaseDatabase.instance.ref('devices').onValue.listen((event) {
+      final data = event.snapshot.value as Map<dynamic, dynamic>?;
+      debugPrint('Received Firebase data: $data');
+      if (data != null && myLocation != null) {
+        Map<String, LatLng> newPeerLocations = {};
+        data.forEach((key, value) {
+          debugPrint('Processing device: $key');
+          if (key != deviceId) {
+            final locData = value as Map<dynamic, dynamic>;
+            if (locData['lat'] != null && locData['lng'] != null) {
+              LatLng peerLoc = LatLng(locData['lat'], locData['lng']);
+              final distance = Distance().as(LengthUnit.Meter, myLocation!, peerLoc);
+              debugPrint('Distance to $key: $distance meters');
+              if (distance <= proximityRadius) {
+                newPeerLocations[key] = peerLoc;
+                debugPrint('Added peer: $key');
+              } else {
+                debugPrint('Peer $key too far: $distance > $proximityRadius');
+              }
+            }
+          }
+        });
+        setState(() {
+          peerLocations = newPeerLocations;
+          _fitAllCars();
+        });
+        _checkProximity();
+      } else {
+        debugPrint('Data null or myLocation null');
+      }
+    });
   }
 
   void _startCompass() {
@@ -230,8 +279,24 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _startLocation() async {
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Location permission is required for the app to work.')),
+      );
+      return;
+    }
+
     bool enabled = await Geolocator.isLocationServiceEnabled();
-    if (!enabled) await Geolocator.requestPermission();
+    if (!enabled) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Location services must be enabled.')),
+      );
+      return;
+    }
 
     Geolocator.getPositionStream(
       locationSettings: const LocationSettings(accuracy: LocationAccuracy.best),
@@ -244,8 +309,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _fitAllCars();
         firstCentered = true;
       }
-      _broadcastLocation();
-      _checkProximity();
       setState(() {});
     });
   }
@@ -274,7 +337,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     allLocations.addAll(peerLocations.values);
     
     if (allLocations.length == 1) {
-      _mapController.move(myLocation!, 20); // Increased zoom
+      _mapController.move(myLocation!, 16);
       return;
     }
     
@@ -295,150 +358,26 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     double lngDiff = maxLng - minLng + (2 * lngPadding);
     double maxDiff = math.max(latDiff, lngDiff);
     
-    double zoom = 20.0; // Increased default zoom
-    if (maxDiff > 0.0005) zoom = 18.0;
-    if (maxDiff > 0.001) zoom = 17.0;
-    if (maxDiff > 0.01) zoom = 15.0;
-    if (maxDiff > 0.1) zoom = 13.0;
-    if (maxDiff > 1.0) zoom = 11.0;
+    double zoom = 16.0;
+    if (maxDiff > 0.0005) zoom = 14.0;
+    if (maxDiff > 0.001) zoom = 13.0;
+    if (maxDiff > 0.01) zoom = 11.0;
+    if (maxDiff > 0.1) zoom = 9.0;
+    if (maxDiff > 1.0) zoom = 7.0;
     
     _mapController.move(center, zoom);
   }
 
-  void _broadcastLocation() {
-    if (myLocation == null) return;
-    for (var ip in peerIps) {
-      if (ip == myIp) continue;
-      try {
-        http.post(
-          Uri.parse("http://$ip:8080"),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'lat': myLocation!.latitude, 
-            'lng': myLocation!.longitude,
-            'proximity': proximityRadius,
-          }),
-        );
-      } catch (_) {}
-    }
-  }
 
-  void _startServer() async {
-    final server = await HttpServer.bind(InternetAddress.anyIPv4, 8080);
-    server.listen((req) async {
-      if (req.method == 'POST') {
-        try {
-          final data = jsonDecode(
-            await req.cast<List<int>>().transform(utf8.decoder).join(),
-          );
-          final ip = req.connectionInfo?.remoteAddress.address;
-
-          if (ip != null && data['lat'] != null && data['lng'] != null) {
-            peerLocations[ip] = LatLng(data['lat'], data['lng']);
-            
-            // Update peer proximity radius
-            if (data['proximity'] != null) {
-              peerProximityRadius[ip] = data['proximity'].toDouble();
-              _savePrefs();
-            }
-            
-            _checkProximity();
-            setState(() {});
-          }
-
-          req.response.statusCode = 200;
-        } catch (e) {
-          req.response.statusCode = 400;
-          debugPrint('Error in server: $e');
-        } finally {
-          await req.response.close();
-        }
-      }
-    });
-  }
-
-  void _startUDPServer() async {
-    udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 8081);
-    udpSocket.listen((event) {
-      if (event == RawSocketEvent.read) {
-        final packet = udpSocket.receive();
-        if (packet != null) {
-          try {
-            final data = jsonDecode(String.fromCharCodes(packet.data));
-            final ip = packet.address.address;
-            
-            if (data['lat'] != null && data['lng'] != null) {
-              peerLocations[ip] = LatLng(data['lat'], data['lng']);
-              
-              if (data['proximity'] != null) {
-                peerProximityRadius[ip] = data['proximity'].toDouble();
-                _savePrefs();
-              }
-              
-              _checkProximity();
-              setState(() {});
-            }
-          } catch (e) {
-            debugPrint('UDP Error: $e');
-          }
-        }
-      }
-    });
-  }
-
-  void _startProximityBroadcast() {
-    proximityBroadcastTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
-      _broadcastProximityViaUDP();
-    });
-  }
-
-  void _broadcastProximityViaUDP() {
-    if (myLocation == null) return;
-    
-    final message = jsonEncode({
-      'lat': myLocation!.latitude,
-      'lng': myLocation!.longitude,
-      'proximity': proximityRadius,
-    });
-    
-    for (var ip in peerIps) {
-      if (ip == myIp) continue;
-      try {
-        udpSocket.send(
-          message.codeUnits,
-          InternetAddress(ip),
-          8081,
-        );
-      } catch (_) {}
-    }
-  }
 
   void _checkProximity() async {
-    if (myLocation == null) return;
-    
-    final distance = Distance();
-    
-    for (var entry in peerLocations.entries) {
-      final ip = entry.key;
-      final loc = entry.value;
-      
-      final dist = distance.as(LengthUnit.Meter, myLocation!, loc);
-      final myRadius = proximityRadius;
-      final peerRadius = peerProximityRadius[ip] ?? 50;
-      
-      // Check if circles intersect
-      if (dist <= (myRadius + peerRadius)) {
-        if (!blinking) {
-          blinking = true;
-          await beepPlayer.play(AssetSource('beep.mp3'));
-          Future.delayed(const Duration(seconds: 3), () {
-            setState(() => blinking = false);
-          });
-        }
-        return;
-      }
+    if (peerLocations.isNotEmpty && !blinking) {
+      blinking = true;
+      await beepPlayer.play(AssetSource('beep.mp3'));
+      Future.delayed(const Duration(seconds: 3), () {
+        setState(() => blinking = false);
+      });
     }
-    blinking = false;
   }
 
   Widget _buildMarker({required LatLng point, required bool isMe, bool isClose = false}) {
@@ -661,72 +600,19 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _openSettingsDialog() {
-    final ipCtrl = TextEditingController();
-    final radiusCtrl = TextEditingController(text: proximityRadius.toInt().toString());
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: Colors.black,
-        title: const Text("Settings", style: TextStyle(color: Colors.white)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text("WiFi: $wifiName", style: const TextStyle(color: Colors.white)),
-            Text("IP: $myIp", style: const TextStyle(color: Colors.white)),
-            TextField(
-              controller: ipCtrl,
-              style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(
-                labelText: "Peer IP", 
-                labelStyle: TextStyle(color: Colors.white),
-                enabledBorder: UnderlineInputBorder(
-                  borderSide: BorderSide(color: Colors.white),
-                ),
-              ),
-            ),
-            TextField(
-              controller: radiusCtrl,
-              keyboardType: TextInputType.number,
-              style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(
-                labelText: "Proximity (m)", 
-                labelStyle: TextStyle(color: Colors.white),
-                enabledBorder: UnderlineInputBorder(
-                  borderSide: BorderSide(color: Colors.white),
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: () {
-                if (ipCtrl.text.isNotEmpty) peerIps.add(ipCtrl.text);
-                final r = double.tryParse(radiusCtrl.text);
-                if (r != null) proximityRadius = r;
-                _savePrefs();
-                Navigator.pop(context);
-                setState(() {});
-              },
-              child: const Text("Save"),
-            ),
-          ],
-        ),
-      ),
-    );
+    _openCompassCalibration();
   }
 
   void _centerAndFit() {
     if (peerLocations.isEmpty) {
       if (myLocation != null) {
-        _mapController.move(myLocation!, 20); // Increased zoom
+        _mapController.move(myLocation!, 16);
       }
     } else {
       _fitAllCars();
     }
   }
 
-  void _restartApp() {
-    SystemChannels.platform.invokeMethod('SystemNavigator.pop');
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -748,43 +634,29 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       ));
     }
 
-    peerLocations.forEach((ip, loc) {
-      if (ip == myIp) return;
-      
-      final distance = Distance();
-      final peerRadius = peerProximityRadius[ip] ?? 50;
-      
-      final dist = myLocation != null ? 
-          distance.as(LengthUnit.Meter, myLocation!, loc) : double.infinity;
-      final isNear = myLocation != null && dist <= (proximityRadius + peerRadius);
-      
+    peerLocations.forEach((deviceId, loc) {
       markers.add(Marker(
         point: loc,
         width: 70,
         height: 70,
-        child: _buildMarker(point: loc, isMe: false, isClose: isNear),
+        child: _buildMarker(point: loc, isMe: false, isClose: true),
       ));
       circles.add(CircleMarker(
         point: loc,
-        radius: peerRadius,
+        radius: proximityRadius,
         useRadiusInMeter: true,
-        color: isNear ? Colors.red.withOpacity(0.3) : Colors.grey.withOpacity(0.2),
+        color: Colors.red.withOpacity(0.3),
       ));
     });
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Peer Tracker'),
+        title: Text('NOVUS PLUS', style: GoogleFonts.archivoBlack(color: const Color(0xFFDC143C))),
         actions: [
           IconButton(
             icon: const Icon(Icons.explore),
             onPressed: _openCompassCalibration,
             tooltip: 'Compass Calibration',
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings), 
-            onPressed: _openSettingsDialog,
-            tooltip: 'Settings',
           ),
         ],
       ),
@@ -813,21 +685,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             onPressed: _centerAndFit,
             tooltip: 'Center & Fit',
           ),
-          const SizedBox(height: 10),
-          FloatingActionButton(
-            heroTag: 'restart',
-            backgroundColor: Colors.orange,
-            child: const Icon(Icons.restart_alt, color: Colors.white),
-            onPressed: _restartApp,
-            tooltip: 'Restart App',
-          ),
         ],
       ),
       body: FlutterMap(
         mapController: _mapController,
         options: MapOptions(
           initialCenter: myLocation ?? const LatLng(0, 0),
-          initialZoom: 20, // Increased zoom
+          initialZoom: 16,
           initialRotation: compassMode ? -headingDegrees : 0,
           interactionOptions: const InteractionOptions(flags: InteractiveFlag.all),
         ),
