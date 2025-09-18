@@ -72,6 +72,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   late AnimationController _messageController;
   late Animation<double> _messageAnimation;
   bool showNearbyMessage = false;
+  Timer? _dismissTimer;
   
   late final AnimationController _blinkController = AnimationController(
     vsync: this,
@@ -117,6 +118,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   void dispose() {
     _carRotationController.dispose();
     _blinkController.dispose();
+    _messageController.dispose();
+    _dismissTimer?.cancel();
     super.dispose();
   }
 
@@ -293,10 +296,19 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       if (!showNearbyMessage) {
         setState(() => showNearbyMessage = true);
         _messageController.forward();
-        Future.delayed(const Duration(seconds: 5), () {
-          _messageController.reverse().then((_) {
-            setState(() => showNearbyMessage = false);
-          });
+      }
+      // Reset dismiss timer on every detection
+      _dismissTimer?.cancel();
+      _dismissTimer = Timer(const Duration(seconds: 2), () {
+        _messageController.reverse().then((_) {
+          setState(() => showNearbyMessage = false);
+        });
+      });
+    } else {
+      _dismissTimer?.cancel();
+      if (showNearbyMessage) {
+        _messageController.reverse().then((_) {
+          setState(() => showNearbyMessage = false);
         });
       }
     }
