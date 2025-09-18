@@ -55,13 +55,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   LatLng? myLocation;
   Map<String, LatLng> peerLocations = {};
   double headingDegrees = 0.0;
-  double compassOffset = 0.0;
-  double magneticDeclination = 0.0;
-  double? magneticHeading;
-  double? headingAccuracy;
-  List<double> headingBuffer = [];
-  double lastStableHeading = 0.0;
-  final double proximityRadius = 10000; // Temporarily increased for testing
+  double proximityRadius = 200;
   bool blinking = false;
   bool firstCentered = false;
   bool compassMode = true;
@@ -74,6 +68,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   late AnimationController _carRotationController;
   late Animation<double> _carRotationAnimation;
   double _lastCarRotation = 0.0;
+
+  late AnimationController _messageController;
+  late Animation<double> _messageAnimation;
+  bool showNearbyMessage = false;
   
   late final AnimationController _blinkController = AnimationController(
     vsync: this,
@@ -98,12 +96,20 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       parent: _carRotationController,
       curve: Curves.easeInOut,
     ));
-    
+
+    _messageController = AnimationController(
+      duration: const Duration(milliseconds: 300),
+      vsync: this,
+    );
+
+    _messageAnimation = Tween<double>(begin: 100, end: 0).animate(
+      CurvedAnimation(parent: _messageController, curve: Curves.easeOut),
+    );
+
     _loadPrefs();
     _startCompass();
     _startLocation();
     _getDeviceId();
-    _startLocationUpdateTimer();
     beepPlayer = AudioPlayer();
   }
 
@@ -111,23 +117,20 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   void dispose() {
     _carRotationController.dispose();
     _blinkController.dispose();
-    locationUpdateTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      compassOffset = prefs.getDouble('compassOffset') ?? 0.0;
-      magneticDeclination = prefs.getDouble('magneticDeclination') ?? 0.0;
+      proximityRadius = prefs.getDouble('proximity') ?? 200;
       compassMode = prefs.getBool('compassMode') ?? true;
     });
   }
 
   Future<void> _savePrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('compassOffset', compassOffset);
-    await prefs.setDouble('magneticDeclination', magneticDeclination);
+    await prefs.setDouble('proximity', proximityRadius);
     await prefs.setBool('compassMode', compassMode);
   }
 
@@ -142,20 +145,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _startFirebaseListener();
   }
 
-  void _startLocationUpdateTimer() {
-    locationUpdateTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (myLocation != null) {
-        debugPrint('Publishing location: ${myLocation!.latitude}, ${myLocation!.longitude}');
-        databaseRef.set({
-          'lat': myLocation!.latitude,
-          'lng': myLocation!.longitude,
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
-        });
-      }
-    });
-  }
 
   void _startFirebaseListener() {
+    const int timeoutMs = 30000; // 30 seconds
     debugPrint('Starting Firebase listener for device: $deviceId');
     FirebaseDatabase.instance.ref('devices').onValue.listen((event) {
       final data = event.snapshot.value as Map<dynamic, dynamic>?;
@@ -166,7 +158,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           debugPrint('Processing device: $key');
           if (key != deviceId) {
             final locData = value as Map<dynamic, dynamic>;
-            if (locData['lat'] != null && locData['lng'] != null) {
+            if (locData['lat'] != null && locData['lng'] != null && locData['timestamp'] != null) {
+              int age = DateTime.now().millisecondsSinceEpoch - (locData['timestamp'] as int);
+              if (age > timeoutMs) {
+                debugPrint('Skipping old location for $key, age: $age ms');
+                return;
+              }
               LatLng peerLoc = LatLng(locData['lat'], locData['lng']);
               final distance = Distance().as(LengthUnit.Meter, myLocation!, peerLoc);
               debugPrint('Distance to $key: $distance meters');
@@ -181,7 +178,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         });
         setState(() {
           peerLocations = newPeerLocations;
-          _fitAllCars();
         });
         _checkProximity();
       } else {
@@ -193,90 +189,16 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   void _startCompass() {
     FlutterCompass.events?.listen((CompassEvent event) {
       if (event.heading != null) {
-        magneticHeading = event.heading;
-        headingAccuracy = event.accuracy;
-        
-        double rawHeading = event.heading!;
-        double correctedHeading = rawHeading + magneticDeclination;
-        double adjustedHeading = correctedHeading + compassOffset;
-        
-        adjustedHeading = adjustedHeading % 360;
-        if (adjustedHeading < 0) adjustedHeading += 360;
-        
-        headingBuffer.add(adjustedHeading);
-        if (headingBuffer.length > 10) {
-          headingBuffer.removeAt(0);
-        }
-        
-        double smoothedHeading = _calculateSmoothedHeading(headingBuffer);
-        
-        double headingDiff = (smoothedHeading - lastStableHeading).abs();
-        if (headingDiff > 180) {
-          headingDiff = 360 - headingDiff;
-        }
-        
-        if (headingDiff > 1.0) {
-          setState(() {
-            headingDegrees = smoothedHeading;
-            lastStableHeading = smoothedHeading;
-          });
-          
-          // Smooth car rotation animation
-          _animateCarRotation(smoothedHeading);
-          
-          if (compassMode && myLocation != null) {
-            _mapController.rotate(-smoothedHeading);
-          }
+        setState(() {
+          headingDegrees = event.heading!;
+        });
+        if (compassMode && myLocation != null) {
+          _mapController.rotate(-headingDegrees);
         }
       }
     });
   }
 
-  void _animateCarRotation(double newHeading) {
-    double currentRotation = _carRotationAnimation.value;
-    double targetRotation = newHeading;
-    
-    // Handle angle wrapping
-    double diff = targetRotation - currentRotation;
-    if (diff > 180) {
-      targetRotation -= 360;
-    } else if (diff < -180) {
-      targetRotation += 360;
-    }
-    
-    _carRotationAnimation = Tween<double>(
-      begin: currentRotation,
-      end: targetRotation,
-    ).animate(CurvedAnimation(
-      parent: _carRotationController,
-      curve: Curves.easeInOut,
-    ));
-    
-    _carRotationController.forward(from: 0.0);
-  }
-
-  double _calculateSmoothedHeading(List<double> headings) {
-    if (headings.isEmpty) return 0.0;
-    if (headings.length == 1) return headings.first;
-    
-    double sumX = 0.0;
-    double sumY = 0.0;
-    
-    for (int i = 0; i < headings.length; i++) {
-      double weight = (i + 1) / headings.length;
-      double heading = headings[i];
-      double radians = heading * math.pi / 180;
-      sumX += math.cos(radians) * weight;
-      sumY += math.sin(radians) * weight;
-    }
-    
-    double avgRadians = math.atan2(sumY, sumX);
-    double avgDegrees = avgRadians * 180 / math.pi;
-    
-    if (avgDegrees < 0) avgDegrees += 360;
-    
-    return avgDegrees;
-  }
 
   void _startLocation() async {
     LocationPermission permission = await Geolocator.checkPermission();
@@ -302,9 +224,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       locationSettings: const LocationSettings(accuracy: LocationAccuracy.best),
     ).listen((position) {
       myLocation = LatLng(position.latitude, position.longitude);
-      
-      _calculateMagneticDeclination(position.latitude, position.longitude);
-      
+
+      debugPrint('Publishing location: ${myLocation!.latitude}, ${myLocation!.longitude}');
+      databaseRef.set({
+        'lat': myLocation!.latitude,
+        'lng': myLocation!.longitude,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      });
+
       if (!firstCentered) {
         _fitAllCars();
         firstCentered = true;
@@ -313,22 +240,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     });
   }
 
-  void _calculateMagneticDeclination(double lat, double lng) {
-    double declination = 0.0;
-    
-    if (lat >= 8.0 && lat <= 13.0 && lng >= 76.0 && lng <= 78.0) {
-      declination = -0.5;
-    } else if (lat >= 20.0 && lat <= 30.0 && lng >= 77.0 && lng <= 85.0) {
-      declination = 0.5;
-    } else if (lat >= 13.0 && lat <= 20.0 && lng >= 77.0 && lng <= 85.0) {
-      declination = 0.0;
-    }
-    
-    if ((declination - magneticDeclination).abs() > 0.1) {
-      magneticDeclination = declination;
-      _savePrefs();
-    }
-  }
 
   void _fitAllCars() {
     if (myLocation == null) return;
@@ -371,12 +282,23 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
 
   void _checkProximity() async {
-    if (peerLocations.isNotEmpty && !blinking) {
-      blinking = true;
-      await beepPlayer.play(AssetSource('beep.mp3'));
-      Future.delayed(const Duration(seconds: 3), () {
-        setState(() => blinking = false);
-      });
+    if (peerLocations.isNotEmpty) {
+      if (!blinking) {
+        blinking = true;
+        await beepPlayer.play(AssetSource('beep.mp3'));
+        Future.delayed(const Duration(seconds: 3), () {
+          setState(() => blinking = false);
+        });
+      }
+      if (!showNearbyMessage) {
+        setState(() => showNearbyMessage = true);
+        _messageController.forward();
+        Future.delayed(const Duration(seconds: 5), () {
+          _messageController.reverse().then((_) {
+            setState(() => showNearbyMessage = false);
+          });
+        });
+      }
     }
   }
 
@@ -389,7 +311,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         animation: _carRotationAnimation,
         builder: (context, child) {
           return Transform.rotate(
-            angle: compassMode ? 0 : _carRotationAnimation.value * math.pi / 180,
+            angle: (compassMode ? headingDegrees : _carRotationAnimation.value) * math.pi / 180,
             child: Image.asset(
               'assets/car_top.png',
               width: 55,
@@ -411,196 +333,48 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         : icon;
   }
 
-  void _openCompassCalibration() {
-    double tempOffset = compassOffset;
+
+
+  void _openSettingsDialog() {
+    final proximityCtrl = TextEditingController(text: proximityRadius.round().toString());
     showDialog(
       context: context,
-      builder: (_) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          backgroundColor: Colors.black,
-          contentPadding: const EdgeInsets.all(16),
-          title: const Text("Compass", style: TextStyle(color: Colors.white, fontSize: 16)),
-          content: SizedBox(
-            width: 250,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 100,
-                  height: 100,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.white, width: 1),
-                    borderRadius: BorderRadius.circular(50),
-                  ),
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      Positioned(
-                        top: 8,
-                        child: Container(
-                          width: 12,
-                          height: 12,
-                          decoration: const BoxDecoration(
-                            color: Colors.red,
-                            shape: BoxShape.circle,
-                          ),
-                          child: const Center(
-                            child: Text('N', style: TextStyle(color: Colors.white, fontSize: 8)),
-                          ),
-                        ),
-                      ),
-                      
-                      Transform.rotate(
-                        angle: (headingDegrees + tempOffset) * math.pi / 180,
-                        child: Container(
-                          width: 2,
-                          height: 60,
-                          decoration: const BoxDecoration(
-                            gradient: LinearGradient(
-                              colors: [Colors.red, Colors.blue],
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                            ),
-                          ),
-                        ),
-                      ),
-                      
-                      Container(
-                        width: 4,
-                        height: 4,
-                        decoration: const BoxDecoration(
-                          color: Colors.white,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                    ],
-                  ),
+      builder: (_) => AlertDialog(
+        backgroundColor: Colors.black,
+        title: const Text("Settings", style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: proximityCtrl,
+              keyboardType: TextInputType.number,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                labelText: "Proximity (meters)",
+                labelStyle: TextStyle(color: Colors.white),
+                enabledBorder: UnderlineInputBorder(
+                  borderSide: BorderSide(color: Colors.white),
                 ),
-                
-                const SizedBox(height: 12),
-                
-                Text(
-                  "${(headingDegrees + tempOffset).toStringAsFixed(1)}°",
-                  style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                Text(
-                  "Offset: ${tempOffset.toStringAsFixed(1)}°",
-                  style: const TextStyle(color: Colors.white70, fontSize: 12),
-                ),
-                Text(
-                  "Declination: ${magneticDeclination.toStringAsFixed(1)}°",
-                  style: const TextStyle(color: Colors.white60, fontSize: 10),
-                ),
-                
-                const SizedBox(height: 16),
-                
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [
-                    _buildCompactButton("-10", () {
-                      setDialogState(() {
-                        tempOffset -= 10;
-                        tempOffset = _normalizeAngle(tempOffset);
-                      });
-                    }),
-                    _buildCompactButton("-1", () {
-                      setDialogState(() {
-                        tempOffset -= 1;
-                        tempOffset = _normalizeAngle(tempOffset);
-                      });
-                    }),
-                    _buildCompactButton("0", () {
-                      setDialogState(() {
-                        tempOffset = 0;
-                      });
-                    }),
-                    _buildCompactButton("+1", () {
-                      setDialogState(() {
-                        tempOffset += 1;
-                        tempOffset = _normalizeAngle(tempOffset);
-                      });
-                    }),
-                    _buildCompactButton("+10", () {
-                      setDialogState(() {
-                        tempOffset += 10;
-                        tempOffset = _normalizeAngle(tempOffset);
-                      });
-                    }),
-                  ],
-                ),
-                
-                const SizedBox(height: 12),
-                
-                ElevatedButton(
-                  onPressed: () {
-                    if (myLocation != null) {
-                      _calculateMagneticDeclination(myLocation!.latitude, myLocation!.longitude);
-                    }
-                    setDialogState(() {
-                      tempOffset = 0;
-                    });
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Magnetic declination updated. Rotate device in figure-8 pattern for 10 seconds'),
-                        duration: Duration(seconds: 3),
-                      ),
-                    );
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blue,
-                    minimumSize: const Size(double.infinity, 32),
-                  ),
-                  child: const Text("Auto Calibrate", style: TextStyle(fontSize: 12)),
-                ),
-              ],
+              ),
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text("Cancel", style: TextStyle(fontSize: 12)),
-            ),
+            const SizedBox(height: 20),
             ElevatedButton(
               onPressed: () {
-                setState(() {
-                  compassOffset = tempOffset;
-                });
-                _savePrefs();
+                final r = double.tryParse(proximityCtrl.text);
+                if (r != null && r > 0) {
+                  setState(() {
+                    proximityRadius = r;
+                  });
+                  _savePrefs();
+                }
                 Navigator.pop(context);
               },
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-              child: const Text("Save", style: TextStyle(fontSize: 12)),
+              child: const Text("Save"),
             ),
           ],
         ),
       ),
     );
-  }
-
-  Widget _buildCompactButton(String label, VoidCallback onPressed) {
-    return SizedBox(
-      width: 35,
-      height: 28,
-      child: ElevatedButton(
-        onPressed: onPressed,
-        style: ElevatedButton.styleFrom(
-          padding: const EdgeInsets.all(2),
-          textStyle: const TextStyle(fontSize: 10),
-        ),
-        child: Text(label),
-      ),
-    );
-  }
-
-  double _normalizeAngle(double angle) {
-    angle = angle % 360;
-    if (angle > 180) angle -= 360;
-    if (angle < -180) angle += 360;
-    return angle;
-  }
-
-  void _openSettingsDialog() {
-    _openCompassCalibration();
   }
 
   void _centerAndFit() {
@@ -630,7 +404,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         point: myLocation!,
         useRadiusInMeter: true,
         radius: proximityRadius,
-        color: blinking ? Colors.red.withOpacity(0.4) : Colors.blue.withOpacity(0.3),
+        color: Colors.grey.withOpacity(0.1),
+        borderStrokeWidth: 2,
+        borderColor: Colors.white,
       ));
     }
 
@@ -645,7 +421,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         point: loc,
         radius: proximityRadius,
         useRadiusInMeter: true,
-        color: Colors.red.withOpacity(0.3),
+        color: Colors.grey.withOpacity(0.1),
+        borderStrokeWidth: 2,
+        borderColor: Colors.yellow,
       ));
     });
 
@@ -654,9 +432,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         title: Text('NOVUS PLUS', style: GoogleFonts.archivoBlack(color: const Color(0xFFDC143C))),
         actions: [
           IconButton(
-            icon: const Icon(Icons.explore),
-            onPressed: _openCompassCalibration,
-            tooltip: 'Compass Calibration',
+            icon: const Icon(Icons.settings),
+            onPressed: _openSettingsDialog,
+            tooltip: 'Settings',
           ),
         ],
       ),
@@ -687,21 +465,45 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           ),
         ],
       ),
-      body: FlutterMap(
-        mapController: _mapController,
-        options: MapOptions(
-          initialCenter: myLocation ?? const LatLng(0, 0),
-          initialZoom: 16,
-          initialRotation: compassMode ? -headingDegrees : 0,
-          interactionOptions: const InteractionOptions(flags: InteractiveFlag.all),
-        ),
+      body: Column(
         children: [
-          TileLayer(
-            urlTemplate: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-            subdomains: const ['a', 'b', 'c'],
+          Flexible(
+            child: FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: myLocation ?? const LatLng(0, 0),
+                initialZoom: 16,
+                initialRotation: compassMode ? -headingDegrees : 0,
+                interactionOptions: const InteractionOptions(flags: InteractiveFlag.all),
+              ),
+              children: [
+                TileLayer(
+                  urlTemplate: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+                  subdomains: const ['a', 'b', 'c'],
+                ),
+                CircleLayer(circles: circles),
+                MarkerLayer(markers: markers),
+              ],
+            ),
           ),
-          CircleLayer(circles: circles),
-          MarkerLayer(markers: markers),
+          if (showNearbyMessage)
+            AnimatedBuilder(
+              animation: _messageAnimation,
+              builder: (context, child) {
+                return Transform.translate(
+                  offset: Offset(0, (1 - _messageAnimation.value) * 100),
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    color: Colors.red,
+                    child: Text(
+                      'Nearby vehicle detected: ${peerLocations.length}',
+                      style: const TextStyle(color: Colors.white, fontSize: 18),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                );
+              },
+            ),
         ],
       ),
     );
